@@ -20,6 +20,7 @@ Pick one with `ORCA_TW_STYLE=<style> ./install.sh`. Any `ORCA_TW_*` variable set
 | Style | What it is | Per-agent color |
 |---|---|---|
 | `ascii` (default) | The table drawn as monospace text (above) | Yes: agent tag/name and its working spinner |
+| `pipeline` | Agents as stages of an [ascii.rest pipeline](https://ascii.rest/pipeline/) inside a rounded frame (below) | Yes: agent mark/name, stage glyph, bar and status |
 | `flap` | A departures board after [ascii.rest/split-flap](https://ascii.rest/split-flap/): amber on black, one tile per character, `▔` split lines | Yes: agent tiles |
 | `table` | TerminalWidget's native table with zebra rows | No: native cells can't be colored |
 
@@ -35,6 +36,28 @@ Pick one with `ORCA_TW_STYLE=<style> ./install.sh`. Any `ORCA_TW_*` variable set
 │ ▔ ▔ ▔   ▔ ▔ ▔ ▔ ▔ ▔ ▔ ▔ ▔ ▔   ▔ ▔ ▔ ▔ ▔ ▔ ▔ ▔ ▔   ▔ ▔ ▔ │
 ╰─────────────────────────────────────────────────────────╯
 ```
+
+```
+╭─ orca · 1 working ───────────────────────────────────────────────────────────╮
+│   ▄▄  ≡ ibm bob  tengingarstjori           ████░░░░░░░░░░░░░░   1m  running  │
+│  !    ◈ cursor   fix navbar                ███████░░░░░░░░░░░   2m  waiting  │
+│  +    ✻ claude   Repository architecture…  ██████████████████  52m  passed   │
+│  ·    ♞ ollama   sandbox                   ··················  38m  idle     │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+Pipeline stages:
+
+| Agent state | Glyph | Bar | Status |
+|---|---|---|---|
+| working | spinner (`ORCA_TW_SPINNER`) | `█` fills with time in the turn, **capped at 90%** | running |
+| blocked / waiting | `!` | holds where it stopped; resumes from there after you approve | waiting |
+| done (Orca hooks) | `+` | full | passed |
+| idle, right after a Bob/Ollama turn | `+` | full | passed (for 10 min) |
+| idle | `·` | `··················` | idle |
+| exited | `x` | `··················` | exited |
+
+The bar isn't real progress: it shows how long the agent has been working. The 90% cap means a long task never looks finished; the bar only goes full on a real `done` from Orca. Bob and Ollama have no hooks and never report `done`, so "was working, now quiet" counts as *passed* for `ORCA_TW_PIPE_PASSED_SECS` (600) and then drops to idle. That's inferred from output stopping, not a confirmed finish. The title line turns amber when an agent needs you. Settings: `ORCA_TW_PIPE_WIDTH` (18), `ORCA_TW_PIPE_CAP` (0.9), `ORCA_TW_PIPE_PASSED_SECS` (600).
 
 Flap settings:
 - `ORCA_TW_FLAP_COLS`: which columns show, default `agent:3,task:10,status:9,since:3`. You can also use `workspace`.
@@ -135,7 +158,7 @@ Set these in the plist's `EnvironmentVariables` and re-run `./install.sh`. You c
 | `ORCA_TW_LABEL` | `logo` | `logo` (glyph mark) or `tag` (`[cld]`) |
 | `ORCA_TW_LOGOS` | (none) | Mark overrides, e.g. `cursor=▲` |
 | `ORCA_TW_FONT_SIZE` | auto | Fixed font size in points, overriding the automatic size |
-| `ORCA_TW_STYLE` | `ascii` | `ascii`, `flap`, `table` |
+| `ORCA_TW_STYLE` | `ascii` | `ascii`, `pipeline`, `flap`, `table` |
 | `ORCA_TW_COLORS` | (none) | Agent color overrides, e.g. `claude=#ff8800` |
 | `ORCA_TW_ANSI` | `truecolor` | `truecolor`, `256`, `off` |
 | `ORCA_TW_SPIN_SECS` | `30` | Seconds per spinner frame |

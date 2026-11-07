@@ -139,6 +139,14 @@ BAR_STYLE = ENV("ORCA_TW_BAR", "equals").lower()
 BAR_WIDTH = int(ENV("ORCA_TW_BAR_WIDTH", "10"))
 BAR_FULL_SECS = float(ENV("ORCA_TW_BAR_FULL_SECS", "300"))
 
+# Pipeline style (https://ascii.rest/pipeline/). A working bar fills with time
+# but stops at PIPE_CAP, so it never looks finished; only a real `done` from
+# Orca draws it full. Agents without hooks never report done, so after a
+# working -> idle change they show "passed" for PIPE_PASSED_SECS, then idle.
+PIPE_WIDTH = int(ENV("ORCA_TW_PIPE_WIDTH", "18"))
+PIPE_CAP = float(ENV("ORCA_TW_PIPE_CAP", "0.9"))
+PIPE_PASSED_SECS = float(ENV("ORCA_TW_PIPE_PASSED_SECS", "600"))
+
 # Per-agent name, 3-letter tag (used on the flap board) and glyph mark shown
 # as "✻ claude". Marks are original stand-ins, not brand logos, and every one
 # is drawn by Menlo itself at exactly one cell wide, so columns stay aligned
@@ -428,13 +436,28 @@ def collect(now, identities, starts=None):
 
     # Agents without hooks don't report when their state began, so remember
     # when we first saw each state (drives the progress bar and "since").
+    # Also remember the state before the current one (pipeline style shows a
+    # finished Bob/Ollama turn as "passed") and the last working bar fill (so
+    # the bar holds its place while an agent waits on you).
     if starts is not None:
         now_ms = now * 1000
         for r in rows:
             prev = starts.get(r["key"])
+            same = bool(prev) and prev[0] == r["state"]
             if r.get("inferred"):
-                r["since_ms"] = prev[1] if prev and prev[0] == r["state"] else now_ms
-            starts[r["key"]] = [r["state"], r["since_ms"]]
+                r["since_ms"] = prev[1] if same else now_ms
+            r["prev_state"] = (prev[2] if len(prev) > 2 else None) if same else (prev[0] if prev else None)
+            fill = prev[3] if prev and len(prev) > 3 else 0.0
+            # resuming after an approval continues the bar instead of restarting it
+            if same:
+                base = prev[4] if len(prev) > 4 else 0.0
+            else:
+                base = fill if prev and prev[0] in ("blocked", "waiting") else 0.0
+            if r["state"] == "working":
+                elapsed = now - (r["since_ms"] or now_ms) / 1000
+                fill = min(PIPE_CAP, base + elapsed / BAR_FULL_SECS)
+            r["last_fill"] = fill
+            starts[r["key"]] = [r["state"], r["since_ms"], r["prev_state"], fill, base]
         for k in set(starts) - {r["key"] for r in rows}:
             del starts[k]
 
@@ -491,6 +514,81 @@ def push_ascii(rows, now, notify, dry):
     tw(args, stdin=text, dry=dry)
 
 
+PASSED_COLOR = "#22c55e"
+IDLE_COLOR = "#6b7280"
+
+
+def pipe_status(r, now):
+    """Map an agent row to a pipeline stage: (glyph, bar fill or None, word, color)."""
+    state, ac = r["state"], agent_color(r.get("agent_id", ""))
+    if state == "working":
+        frames = SPINNERS.get(SPINNER) if SPINNER not in BAR_SHAPED else None
+        frames = frames or SPINNERS["pipe"]
+        return frames[int(now // SPIN_SECS) % len(frames)], r.get("last_fill", 0.0), "running", ac
+    if state in ("blocked", "waiting"):
+        return "!", r.get("last_fill", 0.0), "waiting", STATE_COLORS["blocked"]
+    if state == "done":
+        return "+", 1.0, "passed", PASSED_COLOR
+    if state == "exited":
+        return "x", None, "exited", STATE_COLORS["exited"]
+    # idle: a Bob/Ollama turn that just ended counts as passed for a while
+    if (r.get("inferred") and r.get("prev_state") == "working"
+            and now - (r.get("since_ms") or 0) / 1000 < PIPE_PASSED_SECS):
+        return "+", 1.0, "passed", PASSED_COLOR
+    return "·", None, "idle", IDLE_COLOR
+
+
+def pipe_bar(fill):
+    if fill is None:
+        return "·" * PIPE_WIDTH
+    cells = PIPE_WIDTH if fill >= 1.0 else max(1, min(PIPE_WIDTH - 1, round(fill * PIPE_WIDTH)))
+    return "█" * cells + "░" * (PIPE_WIDTH - cells)
+
+
+def pipeline_render(rows, now):
+    """Agents as stages of an ascii.rest pipeline, inside a rounded frame."""
+    stages = [pipe_status(r, now) for r in rows]
+    cells = [[g, r["agent"], short(r["task"] or r["workspace"], 24), pipe_bar(fill),
+              ago(r["since_ms"], now), word]
+             for r, (g, fill, word, _) in zip(rows, stages)]
+    if not cells:
+        cells = [["·", "no agents running", "", "", "", ""]]
+        stages = [("·", None, "", IDLE_COLOR)]
+        rows = [{"agent_id": ""}]
+    widths = [max(len(c[i]) for c in cells) for i in range(6)]
+    body = []
+    for r, c, (_, fill, _, color) in zip(rows, cells, stages):
+        ac = agent_color(r.get("agent_id", ""))
+        plain = "  ".join(v.ljust(w) for v, w in zip(c, widths))
+        painted = "  ".join([
+            paint(c[0].ljust(widths[0]), color),
+            paint(c[1].ljust(widths[1]), ac),
+            c[2].ljust(widths[2]),
+            paint(c[3].ljust(widths[3]), IDLE_COLOR if fill is None else color),
+            c[4].rjust(widths[4]),
+            paint(c[5].ljust(widths[5]), color),
+        ])
+        body.append((plain, painted))
+    working = sum(r.get("state") == "working" for r in rows)
+    needs = sum(r.get("state") in ("blocked", "waiting") for r in rows)
+    title = f" orca · {working} working" + (f" · {needs} needs you" if needs else "") + " "
+    inner = max(len(title) + 2, *(len(p) + 4 for p, _ in body))
+    top = "╭─" + paint(title, STATE_COLORS["blocked"] if needs else HEADER_COLOR) \
+        + "─" * (inner - len(title) - 1) + "╮"
+    lines = [top] + ["│  " + painted + " " * (inner - len(plain) - 2) + "│"
+                     for plain, painted in body] + ["╰" + "─" * inner + "╯"]
+    return "\n".join(lines)
+
+
+def push_pipeline(rows, now, notify, dry):
+    text = pipeline_render(rows, now)
+    args = ["--text", "-", "--no-wrap", "--ansi-mode", "on", "--timestamp",
+            *text_font_args(text), *TAP]
+    if notify:
+        args.append("--notify-once")
+    tw(args, stdin=text, dry=dry)
+
+
 def tw(args, stdin=None, dry=False):
     cmd = [TW, "--target", TARGET, "--background-mode", *args]
     if dry:
@@ -535,8 +633,8 @@ def push_text(text, color, dry):
 # changes, a short burst of frames rolls each changed tile forward through its
 # drum before settling, staggered left to right and top to bottom.
 
-# ascii (default: colored text table) | table (native TerminalWidget table,
-# no per-agent color) | flap (split-flap departures board)
+# ascii (default: colored text table) | pipeline (ascii.rest pipeline stages)
+# | table (native TerminalWidget table, no per-agent color) | flap (split-flap)
 STYLE = ENV("ORCA_TW_STYLE", "ascii").lower()
 FLAP_DRUM = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-/'&"
 FLAP_DIGITS = " 0123456789"
@@ -771,6 +869,8 @@ def main():
     model = flap_model(rows, now) if flap else None
     if flap:
         shown = flap_render(model) + flap_summary(rows)
+    elif STYLE == "pipeline" and view != "offline":
+        shown = pipeline_render(rows, now)
     elif view == "table":
         shown = ascii_render(rows, now) if STYLE == "ascii" else to_csv(rows, now)
     else:
@@ -795,6 +895,8 @@ def main():
     try:
         if flap:
             push_flap(prev.get("flap"), model, rows, notify and bool(prev), opts.dry_run)
+        elif STYLE == "pipeline" and view != "offline":
+            push_pipeline(rows, now, notify and bool(prev), opts.dry_run)
         elif view == "offline":
             push_text("[x] orca offline", "#ef4444", opts.dry_run)
         elif view == "empty":
