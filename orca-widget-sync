@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+"""orca-widget-sync: mirror Orca agent sessions onto a TerminalWidget desktop widget.
+
+Reads `orca worktree ps --json` (agents that report through Orca status hooks:
+Claude, Gemini, Cursor, ...) plus `orca terminal list --json` (agents without
+hooks, such as IBM Bob and Ollama, matched by terminal title), then pushes a
+table to TerminalWidget only when what it shows has changed.
+
+Run once per invocation; launchd (or a Claude Code hook) calls it repeatedly.
+Python 3.9+ stdlib only, so /usr/bin/python3 works.
+"""
+
+import argparse
+import csv
+import fcntl
+import hashlib
+import io
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------- config ---
+
+ENV = os.environ.get
+ORCA = ENV("ORCA_BIN", "/usr/local/bin/orca")
+TW = ENV("TW_BIN", str(Path.home() / "bin/terminal-widget"))
+TARGET = ENV("ORCA_TW_TARGET", "orca-agents")
+# Terminals without Orca hooks whose title (or agentIdentity) matches this
+# regex are tracked by output activity. First regex group = display name.
+# Title is a shortcut only: TUIs often overwrite it, so SCREEN_SIGS below is
+# the main way unhooked agents are recognised.
+UNHOOKED_RE = ENV("ORCA_TW_UNHOOKED", r"^\s*(bob|ollama|cursor)\b")
+
+# Screen signatures for agents without Orca hooks.
+#   identify: seen on screen -> this terminal runs that agent (remembered per terminal)
+#   blocked:  seen on screen -> agent is waiting on you (approval prompt etc.)
+#   working:  seen on screen -> agent is mid-turn (optional; else output recency)
+SCREEN_SIGS = {
+    # Fallback only: with Orca's Cursor hooks installed (`orca agent hooks on`),
+    # Cursor reports its own state and never reaches this path.
+    "cursor": {
+        "identify": r"Cursor Agent|Plan, search, build anything",
+        "blocked": r"Waiting for approval|Run \(once\)|Allow once|Reject & propose changes",
+        "working": r"ctrl\+c to stop",
+    },
+    "bob": {
+        # banner, idle prompt + footer, and approval dialog (banner scrolls away)
+        "identify": r"(?m)Bob Shell|Build Anything, @ for context|\bbob -r\b|^\s*Agent Mode\s*$"
+                    r"|Always Allow Command for task|Wait for input after execution",
+        "blocked": r"Approve Once|Always Allow Command|Press Enter to confirm",
+    },
+    "ollama": {
+        "identify": r">>> Send a message|Use \"\"\" to begin a multi-line message",
+        "blocked": None,
+    },
+}
+ACTIVE_SECS = float(ENV("ORCA_TW_ACTIVE_SECS", "6"))  # output this recent = working
+NOTIFY_ON = set(ENV("ORCA_TW_NOTIFY_ON", "blocked,waiting").split(","))
+ORCA_APP_ID = ENV("ORCA_TW_APP_ID", "com.stablyai.orca")
+CACHE = Path(ENV("ORCA_TW_CACHE", str(Path.home() / ".cache/orca-widget")))
+CMD_TIMEOUT = 15
+
+# ------------------------------------------------- look (ascii.rest style) ---
+# Monospace font so the ASCII bars and tags line up like a terminal.
+FONT = ENV("ORCA_TW_FONT", "Menlo")
+
+# TerminalWidget's --fit-text doesn't scale multi-line text, so text styles
+# pick a font size that fits the widget: the longest line across, all lines
+# down. Sizes are approximate macOS desktop widget content areas in points.
+WIDGET_SIZES = {"small": (150, 150), "medium": (330, 150), "large": (330, 345),
+                "xl": (700, 345)}
+WIDGET_SIZE = ENV("ORCA_TW_WIDGET_SIZE", "xl").lower()
+FONT_SIZE = ENV("ORCA_TW_FONT_SIZE", "")      # fixed size; empty = automatic
+PADDING = int(ENV("ORCA_TW_PADDING", "18"))     # points around the text (0-64)
+CAPTION_PT = 50                                 # caption + timestamp lines
+MONO_ADVANCE = 0.61                             # Menlo glyph width per point
+LINE_HEIGHT = 1.25
+
+
+def text_font_args(text):
+    """--font/--font-size for a text block sized to fill the widget."""
+    if FONT_SIZE:
+        size = float(FONT_SIZE)
+    else:
+        w, h = WIDGET_SIZES.get(WIDGET_SIZE, WIDGET_SIZES["xl"])
+        w, h = w - 2 * PADDING, h - 2 * PADDING
+        lines = re.sub(r"\x1b\[[0-9;]*m", "", text).split("\n")
+        cols = max((len(l) for l in lines), default=1)
+        size = min(w / (cols * MONO_ADVANCE), (h - CAPTION_PT) / (len(lines) * LINE_HEIGHT))
+        size = max(6.0, min(28.0, size))
+    # No --padding fill: its full-width mode overrides --font-size.
+    return ["--font", FONT or "Menlo", "--font-size", f"{size:.1f}", "--padding", str(PADDING)]
+
+# Orca agent states (from the Orca app: working|blocked|waiting|done|idle),
+# plus `exited` for terminals we infer ourselves. Glyphs follow ascii.rest's
+# pipeline component (+ passed, x failed, · queued); `working` is drawn live
+# by state_cell() as spinner + progress bar.
+STATE_LABEL = {
+    "blocked": "! needs you",
+    "waiting": "! needs you",
+    "idle": "· idle",
+    "done": "+ done",
+    "exited": "x exited",
+}
+STATE_RANK = {"blocked": 0, "waiting": 0, "working": 1, "idle": 2, "done": 3, "exited": 4}
+
+# Spinner for `working`, frames from https://ascii.rest/spinners/. The widget
+# only redraws when we push, so it advances one frame per tick (SPIN_SECS).
+# While anything is working the widget is pushed every tick; when nothing is,
+# pushes stop. ORCA_TW_SPINNER=none gives a static display.
+SPINNERS = {
+    "pipe":   ["|", "/", "-", "\\"],
+    "loop":   ["▀▀ ", "▝▀▘", " ▀▀", " ▝▜", "  █", " ▗▟", " ▄▄", "▗▄▖", "▄▄ ", "▙▖ ", "█  ", "▛▘ "],
+    # bar-shaped spinners replace the progress bar instead of prefixing it
+    "scan":   ["█······", "▓█·····", "░▓█····", "·░▓█···", "··░▓█··", "···░▓█·",
+               "······█", "·····█▓", "····█▓░", "···█▓░·", "··█▓░··", "·█▓░···"],
+    "bounce": ["[o     ]", "[ o    ]", "[  o   ]", "[   o  ]", "[    o ]",
+               "[     o]", "[    o ]", "[   o  ]", "[  o   ]", "[ o    ]"],
+    "slide":  ["[=       ]", "[==      ]", "[===     ]", "[ ===    ]", "[  ===   ]",
+               "[   ===  ]", "[    === ]", "[     ===]", "[      ==]", "[       =]"],
+    "wave":   ["▅▇█▇▅▂▁", "▂▅▇█▇▅▂", "▁▂▅▇█▇▅", "▂▁▂▅▇█▇",
+               "▅▂▁▂▅▇█", "▇▅▂▁▂▅▇", "█▇▅▂▁▂▅", "▇█▇▅▂▁▂"],
+}
+BAR_SHAPED = {"scan", "bounce", "slide", "wave"}
+SPINNER = ENV("ORCA_TW_SPINNER", "pipe").lower()
+# One frame per 30 s by default: macOS only redraws desktop widgets every
+# ~30-60 s, so faster frames would be pushed but never shown.
+SPIN_SECS = float(ENV("ORCA_TW_SPIN_SECS", "30"))
+
+# Progress bar for `working`, styles from https://ascii.rest/progress-bar/.
+# Agents don't report % complete, so the bar fills with time spent in the
+# current turn: full after BAR_FULL_SECS. equals|hash|blocks|lamps|line|none
+BAR_STYLE = ENV("ORCA_TW_BAR", "equals").lower()
+BAR_WIDTH = int(ENV("ORCA_TW_BAR_WIDTH", "10"))
+BAR_FULL_SECS = float(ENV("ORCA_TW_BAR_FULL_SECS", "300"))
+
+# Per-agent name, 3-letter tag (used on the flap board) and glyph mark shown
+# as "✻ claude". Marks are original stand-ins, not brand logos, and every one
+# is drawn by Menlo itself at exactly one cell wide, so columns stay aligned
+# (glyphs Menlo lacks fall back to Apple Symbols at a different width).
+AGENTS = {
+    "claude": ("claude", "cld", "✻"),    # Claude Code's own spinner star
+    "bob":    ("ibm bob", "bob", "≡"),   # IBM's striped wordmark
+    "cursor": ("cursor", "cur", "◈"),    # Cursor's cube
+    "ollama": ("ollama", "oll", "♞"),    # nearest animal glyph to a llama
+    "gemini": ("gemini", "gem", "✦"),    # Gemini's sparkle
+    "codex":  ("codex", "cdx", "◎"),
+}
+DEFAULT_MARK = "•"
+# logo (glyph mark, default) | tag ("[cld] claude")
+LABEL = ENV("ORCA_TW_LABEL", "logo").lower()
+# Terminal titles that say nothing about the task.
+NOISE_TITLES = {"", "zsh", "bash", "fish", "sh", "-zsh", "agent", "cli", "shell", "terminal"}
+# Variants Orca or a terminal might report, mapped to the keys above.
+AGENT_ALIASES = {
+    "cursor-agent": "cursor", "cursor-cli": "cursor", "cursor agent": "cursor",
+    "ibm-bob": "bob", "bob-shell": "bob", "ibm bob": "bob",
+    "claude-code": "claude", "claude code": "claude",
+}
+# Per-agent color (ANSI truecolor in text styles). Chosen to stay distinct
+# from each other and readable on both light and dark widget backgrounds.
+AGENT_COLORS = {
+    "claude": "#e07a3f",   # orange
+    "bob":    "#4589ff",   # IBM blue
+    "cursor": "#2dd4bf",   # teal
+    "ollama": "#f472b6",   # pink
+    "gemini": "#a78bfa",   # violet
+    "codex":  "#22c55e",   # green
+}
+DEFAULT_AGENT_COLOR = "#9ca3af"
+STATE_COLORS = {"blocked": "#f59e0b", "waiting": "#f59e0b", "exited": "#ef4444"}
+HEADER_COLOR = "#8b8b8b"
+# truecolor | 256 | off
+ANSI = ENV("ORCA_TW_ANSI", "truecolor").lower()
+# e.g. ORCA_TW_COLORS="cursor=#ffffff,claude=#ff8800"
+for _pair in filter(None, ENV("ORCA_TW_COLORS", "").split(",")):
+    _k, _, _v = _pair.partition("=")
+    if _v.strip():
+        AGENT_COLORS[_k.strip().lower()] = _v.strip()
+
+# Overrides without editing the script:
+#   ORCA_TW_TAGS="cursor=crs,claude=cc"   ORCA_TW_LOGOS="cursor=▲,ollama=ʘ"
+for _env, _slot in (("ORCA_TW_TAGS", 1), ("ORCA_TW_LOGOS", 2)):
+    for _pair in filter(None, ENV(_env, "").split(",")):
+        _k, _, _v = _pair.partition("=")
+        _k = _k.strip().lower()
+        if _v.strip():
+            _cur = list(AGENTS.get(_k, (_k, _k[:3], DEFAULT_MARK)))
+            _cur[_slot] = _v.strip()
+            AGENTS[_k] = tuple(_cur)
+
+
+# --------------------------------------------------------------- helpers ---
+
+def log(msg):
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}", file=sys.stderr)
+
+
+def orca_json(*args):
+    """Run an orca CLI command with --json and return its `result`."""
+    out = subprocess.run([ORCA, *args, "--json"], capture_output=True, text=True,
+                         timeout=CMD_TIMEOUT)
+    if out.returncode != 0:
+        raise RuntimeError(f"orca {' '.join(args)} failed: {out.stderr.strip()[:300]}")
+    data = json.loads(out.stdout)
+    if not data.get("ok", True):
+        raise RuntimeError(f"orca {' '.join(args)}: {data.get('error')}")
+    return data.get("result", {})
+
+
+def ago(ms, now):
+    if not ms:
+        return ""
+    s = max(0, int(now - ms / 1000))
+    if s < 60:
+        return "now"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def agent_id(name):
+    """Normalize an agent name/type to a key of AGENTS (or a lowercase fallback)."""
+    key = (name or "agent").strip().lower()
+    return AGENT_ALIASES.get(key, key)
+
+
+def agent_label(aid):
+    name, tag, mark = AGENTS.get(aid, (aid, aid[:3], DEFAULT_MARK))
+    if LABEL == "tag":
+        return f"[{tag or aid[:3]}] {name}"
+    return f"{mark or DEFAULT_MARK} {name}"
+
+
+def paint(text, color):
+    """Wrap text in an ANSI foreground color (#rrggbb); no-op if disabled."""
+    if not color or ANSI == "off" or not text.strip():
+        return text
+    h = color.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    if ANSI == "256":
+        code = f"38;5;{16 + 36 * round(r / 51) + 6 * round(g / 51) + round(b / 51)}"
+    else:
+        code = f"38;2;{r};{g};{b}"
+    return f"\x1b[{code}m{text}\x1b[0m"
+
+
+def agent_color(aid):
+    return AGENT_COLORS.get(aid, DEFAULT_AGENT_COLOR)
+
+
+def bar(p, style=BAR_STYLE, w=BAR_WIDTH):
+    """Render a progress bar (0..1) in one of the ascii.rest styles."""
+    p = max(0.0, min(1.0, p))
+    f = max(1, round(p * w))  # always show a sliver while working
+    if style == "hash":
+        return "[" + "#" * f + "." * (w - f) + "]"
+    if style == "blocks":
+        eighths = max(1, int(p * w * 8))
+        full, rem = divmod(eighths, 8)
+        cells = "█" * full + (" ▏▎▍▌▋▊▉"[rem] if full < w and rem else "")
+        return "▕" + cells.ljust(w) + "▏"
+    if style == "lamps":
+        return "█" * f + "░" * (w - f)
+    if style == "line":
+        return "━" * f + "─" * (w - f)
+    # equals (default)
+    return "[" + ("=" * w if f >= w else "=" * (f - 1) + ">" + " " * (w - f)) + "]"
+
+
+def state_cell(row, now):
+    """The State column: ascii.rest glyphs, or spinner + bar while working."""
+    state = row["state"]
+    if state != "working":
+        return STATE_LABEL.get(state, state)
+    since = (row.get("since_ms") or now * 1000) / 1000
+    progress = bar((now - since) / BAR_FULL_SECS) if BAR_STYLE != "none" else ""
+    frames = SPINNERS.get(SPINNER)
+    if not frames:
+        return progress or "| working"
+    frame = frames[int(now // SPIN_SECS) % len(frames)]
+    if SPINNER in BAR_SHAPED:
+        return frame
+    return f"{frame} {progress}".rstrip()
+
+
+def issue_label(wt):
+    """Short key for the issue/PR linked to an Orca workspace, if any."""
+    if not wt:
+        return ""
+    for field, prefix in (("linkedLinearIssue", ""), ("linkedIssue", "#"),
+                          ("linkedGitLabIssue", "#"), ("linkedPR", "PR "),
+                          ("linkedGitLabMR", "!")):
+        v = wt.get(field)
+        if isinstance(v, dict):
+            v = v.get("identifier") or v.get("key") or v.get("number") or v.get("id")
+        if v not in (None, ""):
+            s = str(v)
+            return s if (not prefix or s.startswith(prefix.strip())) else f"{prefix}{s}"
+    return ""
+
+
+def task_label(issue, task):
+    return f"{issue} {task}".strip() if issue else task
+
+
+def workspace_label(repo, display):
+    if not display or display in ("main", "master") or display == repo:
+        return repo or "?"
+    return f"{repo}/{display}"
+
+
+def short(text, n):
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+# ------------------------------------------------------------ collection ---
+
+def read_screen(handle):
+    try:
+        res = orca_json("terminal", "read", "--terminal", handle, "--screen", "--limit", "60")
+        return "\n".join(res.get("terminal", {}).get("tail") or [])
+    except Exception as e:
+        log(f"read {handle}: {e}")
+        return ""
+
+
+def identify(screen):
+    for name, sig in SCREEN_SIGS.items():
+        if re.search(sig["identify"], screen):
+            return name
+    return None
+
+
+def collect(now, identities, starts=None):
+    """Return row dicts (key, agent, workspace, task, state, since_ms).
+
+    `identities` maps terminal handle -> agent name for unhooked terminals seen
+    before; it is updated in place so the caller can persist it (an agent's
+    banner scrolls off screen, but the terminal is still that agent).
+    """
+    rows, hooked_panes, wt_by_path = [], set(), {}
+
+    for wt in orca_json("worktree", "ps").get("worktrees", []):
+        wt_by_path[wt.get("path")] = wt
+        ws = workspace_label(wt.get("repo"), wt.get("displayName"))
+        issue = issue_label(wt)
+        for a in wt.get("agents") or []:
+            if not a.get("hasLivePty"):
+                continue  # history from a closed session
+            pane = a.get("paneKey") or ""
+            hooked_panes.add(pane)
+            aid = agent_id(a.get("agentType"))
+            rows.append({
+                "key": pane or f"{ws}:{aid}",
+                "agent_id": aid,
+                "agent": agent_label(aid),
+                "workspace": ws,
+                "task": task_label(issue, a.get("conversationName") or a.get("taskTitle")
+                                   or a.get("prompt") or ""),
+                "state": a.get("state") or "idle",
+                "since_ms": a.get("stateStartedAt") or a.get("updatedAt"),
+            })
+
+    rx = re.compile(UNHOOKED_RE, re.I)
+    live_handles = set()
+    for t in orca_json("terminal", "list").get("terminals", []):
+        pane = f"{t.get('tabId')}:{t.get('leafId')}"
+        handle = t.get("handle") or pane
+        live_handles.add(handle)
+        ident = agent_id(t.get("agentIdentity")) if t.get("agentIdentity") else ""
+        if pane in hooked_panes or (ident and ident not in SCREEN_SIGS and not rx.search(ident)):
+            continue  # covered by hooks, or a hooked-type agent with no live row
+        title = t.get("title") or ""
+        m = rx.search(title)
+        connected = t.get("connected", True) and not t.get("orphaned")
+        screen = read_screen(handle) if connected else ""
+
+        # Screen wins (most reliable), then title, then Orca's identity guess,
+        # then what we identified on an earlier pass.
+        name = identify(screen) or (agent_id(m.group(1)) if m and m.groups() else None) \
+            or (ident or None) or identities.get(handle)
+        if not name:
+            continue  # a plain shell or something we don't track
+        identities[handle] = name
+
+        last = t.get("lastOutputAt")
+        sig = SCREEN_SIGS.get(name, {})
+        if not connected:
+            state = "exited"
+        elif sig.get("blocked") and re.search(sig["blocked"], screen):
+            state = "blocked"
+        elif sig.get("working") and re.search(sig["working"], screen):
+            state = "working"
+        elif last and now - last / 1000 < ACTIVE_SECS:
+            state = "working"
+        else:
+            state = "idle"
+        task = rx.sub("", title, count=1).strip(" :-·—")
+        if (re.match(r"^\S+@\S+:", task)            # shell's "user@host: ~/path" title
+                or task.lower() in NOISE_TITLES     # "zsh", or "agent" left from "cursor-agent"
+                or agent_id(title) in AGENTS):      # title is just the agent's name
+            task = ""
+        wt = wt_by_path.get(t.get("worktreePath"))
+        rows.append({
+            "key": pane,
+            "agent_id": name,
+            "agent": agent_label(name),
+            "workspace": workspace_label(wt.get("repo"), wt.get("displayName")) if wt
+                         else Path(t.get("worktreePath") or "?").name,
+            "task": task_label(issue_label(wt), task),
+            "state": state,
+            "since_ms": last,
+            "inferred": True,
+        })
+
+    for h in list(identities):
+        if h not in live_handles:
+            del identities[h]  # terminal closed
+
+    # Agents without hooks don't report when their state began, so remember
+    # when we first saw each state (drives the progress bar and "since").
+    if starts is not None:
+        now_ms = now * 1000
+        for r in rows:
+            prev = starts.get(r["key"])
+            if r.get("inferred"):
+                r["since_ms"] = prev[1] if prev and prev[0] == r["state"] else now_ms
+            starts[r["key"]] = [r["state"], r["since_ms"]]
+        for k in set(starts) - {r["key"] for r in rows}:
+            del starts[k]
+
+    rows.sort(key=lambda r: (STATE_RANK.get(r["state"], 9), r["agent_id"], r["workspace"]))
+    return rows
+
+
+# ---------------------------------------------------------------- render ---
+
+def to_csv(rows, now):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["agent", "workspace", "task", "state", "since"])
+    for r in rows:
+        w.writerow([r["agent"], short(r["workspace"], 22), short(r["task"], 28),
+                    state_cell(r, now), ago(r["since_ms"], now)])
+    return buf.getvalue()
+
+
+def ascii_render(rows, now):
+    """The table drawn as monospace text, with each agent in its own color.
+
+    Native --table cells can't be colored, so the default style draws the
+    table itself and lets TerminalWidget parse the ANSI colors.
+    """
+    head = ["agent", "workspace", "task", "state", "since"]
+    plain = [[r["agent"], short(r["workspace"], 22), short(r["task"], 28),
+              state_cell(r, now), ago(r["since_ms"], now)] for r in rows]
+    widths = [max(len(c[i]) for c in [head] + plain) for i in range(len(head))]
+
+    def line(cells, colors):
+        return "  ".join(paint(c.ljust(w), col) for c, w, col in zip(cells, widths, colors)).rstrip()
+
+    out = [line(head, [HEADER_COLOR] * 5),
+           paint("─" * (sum(widths) + 2 * (len(widths) - 1)), HEADER_COLOR)]
+    for r, cells in zip(rows, plain):
+        ac = agent_color(r.get("agent_id", ""))
+        sc = ac if r["state"] == "working" else STATE_COLORS.get(r["state"])
+        out.append(line(cells, [ac, None, None, sc, None]))
+    return "\n".join(out)
+
+
+def push_ascii(rows, now, notify, dry):
+    needs = sum(r["state"] in ("blocked", "waiting") for r in rows)
+    working = sum(r["state"] == "working" for r in rows)
+    summary = f"orca · {working} working" + (f" · {needs} needs you" if needs else "")
+    text = ascii_render(rows, now)
+    args = ["--text", "-", "--no-wrap", "--ansi-mode", "on",
+            "--caption-text", summary, "--timestamp", *text_font_args(text), *TAP]
+    if needs:
+        args += ["--caption-color", "#f59e0b"]
+    if notify:
+        args.append("--notify-once")
+    tw(args, stdin=text, dry=dry)
+
+
+def tw(args, stdin=None, dry=False):
+    cmd = [TW, "--target", TARGET, "--background-mode", *args]
+    if dry:
+        print("$", " ".join(cmd))
+        if stdin:
+            print(stdin)
+        return
+    out = subprocess.run(cmd, input=stdin, capture_output=True, text=True, timeout=CMD_TIMEOUT)
+    if out.returncode != 0:
+        raise RuntimeError(f"terminal-widget failed: {out.stderr.strip()[:300]}")
+
+
+TAP = ["--action-kind", "open-app", "--action-value", ORCA_APP_ID]
+
+
+def push_table(rows, now, notify, dry):
+    needs = sum(r["state"] in ("blocked", "waiting") for r in rows)
+    working = sum(r["state"] == "working" for r in rows)
+    # Tables don't accept --title, so the summary goes in the caption line,
+    # styled like an ascii.rest status line.
+    summary = f"orca · {working} working" + (f" · {needs} needs you" if needs else "")
+    args = ["--table", "-", "--grid", "zebra", "--table-layout", "fill", "--fit-text",
+            "--caption-text", summary, "--timestamp", *FONT_ARGS, *TAP]
+    if needs:
+        args += ["--caption-color", "#f59e0b"]
+    if notify:
+        args.append("--notify-once")
+    tw(args, stdin=to_csv(rows, now), dry=dry)
+
+
+FONT_ARGS = ["--font", FONT] if FONT else []
+
+
+def push_text(text, color, dry):
+    tw(["--text", text, "--fg", color, "--fit-text", "--timestamp", *FONT_ARGS, *TAP], dry=dry)
+
+
+# ------------------------------------------------- split-flap board style ---
+# ORCA_TW_STYLE=flap renders a departures board after https://ascii.rest/split-flap/
+# (MIT): one character per tile, tiles every 2 columns, a ▔ split line under
+# each tile, and ▀ on the split line while a flap is turning. When the board
+# changes, a short burst of frames rolls each changed tile forward through its
+# drum before settling, staggered left to right and top to bottom.
+
+# ascii (default: colored text table) | table (native TerminalWidget table,
+# no per-agent color) | flap (split-flap departures board)
+STYLE = ENV("ORCA_TW_STYLE", "ascii").lower()
+FLAP_DRUM = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-/'&"
+FLAP_DIGITS = " 0123456789"
+FLAP_SHOWN = int(ENV("ORCA_TW_FLAP_ROWS", "6"))
+# Flip animation frames per change. Off by default: macOS redraws desktop
+# widgets only every ~30-60 s and drops pushes in between, so a fast burst is
+# mostly never seen (watch `terminal-widget log` for "Rendered revision").
+FLAP_FRAMES = int(ENV("ORCA_TW_FLAP_FRAMES", "0"))
+FLAP_FRAME_SECS = float(ENV("ORCA_TW_FLAP_FRAME_SECS", "0.35"))
+FLAP_FG = ENV("ORCA_TW_FLAP_FG", "#f5c542")              # amber on black
+FLAP_BG = ENV("ORCA_TW_FLAP_BG", "#0b0b0b")
+FLAP_TITLE = ENV("ORCA_TW_FLAP_TITLE", "AGENTS")
+# field:tiles, from agent | workspace | task | status | since
+FLAP_COLS = [(f, int(n)) for f, _, n in (c.partition(":") for c in
+             ENV("ORCA_TW_FLAP_COLS", "agent:1,task:12,status:9,since:3" if LABEL == "logo"
+                 else "agent:3,task:10,status:9,since:3").split(","))]
+FLAP_STATUS = {"working": "WORKING", "blocked": "NEEDS YOU", "waiting": "NEEDS YOU",
+               "idle": "IDLE", "done": "DONE", "exited": "EXITED"}
+
+
+def flap_text(s, n):
+    s = (s or "").upper().replace("_", "-").replace("—", "-")
+    s = "".join(c if c in FLAP_DRUM else " " for c in s)
+    return " ".join(s.split())[:n].ljust(n)
+
+
+def flap_model(rows, now):
+    """Board content as plain data (JSON-safe, so the last one can be saved)."""
+    out = []
+    for r in rows[:FLAP_SHOWN]:
+        aid = r.get("agent_id", "")
+        vals = {
+            "agent": AGENTS.get(aid, (aid, aid[:3], ""))[1] or aid[:3],
+            "workspace": r["workspace"].split("/")[-1],
+            "task": r["task"] or r["workspace"].split("/")[0],
+            "status": FLAP_STATUS.get(r["state"], r["state"]),
+            "since": ago(r["since_ms"], now),
+        }
+        mark = AGENTS.get(aid, ("", "", DEFAULT_MARK))[2] or DEFAULT_MARK
+        out.append([mark.ljust(n)[:n] if f == "agent" and LABEL == "logo"
+                    else flap_text(vals[f], n) for f, n in FLAP_COLS])
+    colors =[agent_color(r.get("agent_id", "")) for r in rows[:FLAP_SHOWN]]
+    while len(out) < FLAP_SHOWN:
+        out.append([" " * n for _, n in FLAP_COLS])
+        colors.append(None)
+    return {"clock": time.strftime("%H%M", time.localtime(now)), "rows": out,
+            "colors": colors}
+
+
+def flap_render(model, turning=frozenset()):
+    """Board text. `turning` holds (row, field, index) tiles mid-flip; row -1 = clock."""
+    def tiles(s):
+        return " ".join(s)
+
+    def split_line(s, r, f):
+        return " ".join("▀" if (r, f, i) in turning else "▔" for i in range(len(s)))
+
+    c = model["clock"]
+    clock = f"{tiles(c[:2])} : {tiles(c[2:])}"
+    clock_split = f"{split_line(c[:2], -1, 0)}   {split_line(c[2:], -1, 1)}"
+    # header labels that don't fit their column (e.g. a 1-tile glyph) are blank
+    labels = "   ".join((f if len(f) <= 2 * n - 1 else "").ljust(2 * n - 1) for f, n in FLAP_COLS)
+    colors = model.get("colors") or []
+    agent_f = next((i for i, (f, _) in enumerate(FLAP_COLS) if f == "agent"), None)
+    body, painted = [], []
+    for r, fields in enumerate(model["rows"]):
+        color = colors[r] if r < len(colors) else None
+        tile_row = [tiles(v) for v in fields]
+        body.append("   ".join(tile_row))
+        # agent tiles in the agent's color; padding is computed on plain text
+        painted.append("   ".join(paint(t, color) if f == agent_f else t
+                                  for f, t in enumerate(tile_row)))
+        split = "   ".join(split_line(v, r, f) for f, v in enumerate(fields))
+        body.append(split)
+        painted.append(split)
+    title = tiles(f"ORCA {FLAP_TITLE}".upper()).replace("   ", "     ")
+    width = max(len(labels), len(title) + len(clock) + 4, *(len(b) for b in body))
+    lines = [
+        "╭" + "─" * (width + 2) + "╮",
+        "│ " + title + " " * (width - len(title) - len(clock)) + clock + " │",
+        "│ " + " " * (width - len(clock_split)) + clock_split + " │",
+        "├" + "─" * (width + 2) + "┤",
+        "│ " + labels.ljust(width) + " │",
+        *("│ " + p + " " * (width - len(b)) + " │" for b, p in zip(body, painted)),
+        "╰" + "─" * (width + 2) + "╯",
+    ]
+    return "\n".join(lines)
+
+
+def flap_frames(old, new, count=FLAP_FRAMES):
+    """Intermediate boards rolling `old` toward `new`, each drum moving forward."""
+    def roll(a_str, b_str, drum, t, delay):
+        out, moving = [], []
+        for i, (a, b) in enumerate(zip(a_str, b_str)):
+            ai, bi = drum.find(a), drum.find(b)
+            ai, bi = max(ai, 0), max(bi, 0)
+            need = (bi - ai) % len(drum)
+            prog = max(0.0, min(1.0, t * 1.4 - delay - i * 0.03))
+            flips = int(need * prog)
+            if flips < need:
+                out.append(drum[(ai + flips) % len(drum)])
+                moving.append(i)
+            else:
+                out.append(b)
+        return "".join(out), moving
+
+    if not old or len(old.get("rows", [])) != len(new["rows"]):
+        old = {"clock": "    ", "rows": [[" " * len(v) for v in r] for r in new["rows"]]}
+    frames = []
+    for k in range(1, count + 1):
+        t = k / (count + 1)
+        turning, rows = set(), []
+        ck, mv = roll(old["clock"], new["clock"], FLAP_DIGITS, t, 0)
+        turning |= {(-1, 0 if i < 2 else 1, i % 2) for i in mv}
+        for r, (orow, nrow) in enumerate(zip(old["rows"], new["rows"])):
+            fields = []
+            for f, (ov, nv) in enumerate(zip(orow, nrow)):
+                if len(ov) != len(nv):
+                    ov = " " * len(nv)
+                v, mv = roll(ov, nv, FLAP_DRUM, t, r * 0.05 + f * 0.04)
+                turning |= {(r, f, i) for i in mv}
+                fields.append(v)
+            rows.append(fields)
+        if turning:
+            frames.append(({"clock": ck, "rows": rows, "colors": new.get("colors")},
+                           frozenset(turning)))
+    return frames
+
+
+def flap_summary(rows):
+    needs = sum(r["state"] in ("blocked", "waiting") for r in rows)
+    working = sum(r["state"] == "working" for r in rows)
+    extra = len(rows) - FLAP_SHOWN
+    return (f"orca · {working} working" + (f" · {needs} needs you" if needs else "")
+            + (f" · +{extra} more" if extra > 0 else ""))
+
+
+def push_flap(prev_model, model, rows, notify, dry):
+    base = ["--text", "-", "--no-wrap", "--ansi-mode", "on", *text_font_args(flap_render(model)),
+            "--fg", FLAP_FG, "--bg", FLAP_BG, "--caption-text", flap_summary(rows), *TAP]
+    if prev_model and FLAP_FRAMES > 0:
+        for frame, turning in flap_frames(prev_model, model):
+            tw(base, stdin=flap_render(frame, turning), dry=dry)
+            if not dry:
+                time.sleep(FLAP_FRAME_SECS)
+    tw(base + (["--notify-once"] if notify else []), stdin=flap_render(model), dry=dry)
+
+
+# ----------------------------------------------------------------- watch ---
+
+def watch(interval=2.0, max_secs=None):
+    """Print a line whenever any agent's state changes."""
+    seen, identities, starts, start = {}, {}, {}, time.time()
+    # Stop cleanly on Ctrl-C or `kill`, even when started from a background
+    # job (which inherits an ignored SIGINT).
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt))
+    try:
+        while max_secs is None or time.time() - start < max_secs:
+            now = time.time()
+            try:
+                rows = collect(now, identities, starts)
+            except Exception as e:
+                log(f"collect: {e}")
+                rows = []
+            current = {r["key"]: r for r in rows}
+            for k, r in current.items():
+                if seen.get(k) != r["state"]:
+                    old = seen.get(k, "-")
+                    print(f"{time.strftime('%H:%M:%S')}  {r['agent']:<14} {short(r['workspace'], 20):<20} "
+                          f"{old:>8} → {r['state']:<8} {short(r['task'], 40)}", flush=True)
+            for k in set(seen) - set(current):
+                print(f"{time.strftime('%H:%M:%S')}  {k[:12]}… gone", flush=True)
+            seen = {k: r["state"] for k, r in current.items()}
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+# ------------------------------------------------------------------ main ---
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--dry-run", action="store_true", help="print instead of pushing")
+    ap.add_argument("--force", action="store_true", help="push even if nothing changed")
+    ap.add_argument("--print", action="store_true", help="print collected rows as JSON")
+    ap.add_argument("--watch", action="store_true",
+                    help="print agent state changes every 2s until Ctrl-C (no widget push)")
+    opts = ap.parse_args()
+
+    if opts.watch:
+        return watch()
+
+    CACHE.mkdir(parents=True, exist_ok=True)
+    lock = open(CACHE / "lock", "w")
+    try:
+        # Manual --force/--print runs wait their turn; timer/hook runs just skip.
+        fcntl.flock(lock, fcntl.LOCK_EX | (0 if opts.force or opts.print else fcntl.LOCK_NB))
+    except BlockingIOError:
+        return 0  # another run (timer vs hook) is already in progress
+
+    state_file = CACHE / "state.json"
+    try:
+        prev = json.loads(state_file.read_text())
+    except (OSError, ValueError):
+        prev = {}
+
+    identities = dict(prev.get("identities", {}))
+    starts = dict(prev.get("starts", {}))
+    now = time.time()
+    try:
+        status = orca_json("status")
+        online = bool(status.get("runtime", {}).get("reachable"))
+    except Exception as e:  # orca missing, app closed, timeout
+        log(f"orca status: {e}")
+        online = False
+
+    if not online:
+        view, rows = "offline", []
+    else:
+        rows = collect(now, identities, starts)
+        view = "table" if rows else "empty"
+
+    if opts.print:
+        print(json.dumps(rows, indent=2))
+
+    # Hash only what is displayed (ages are coarse), so we push only when
+    # something visible changes: every tick while a spinner is turning, never
+    # while everything is idle.
+    flap = STYLE == "flap" and view != "offline"
+    model = flap_model(rows, now) if flap else None
+    if flap:
+        shown = flap_render(model) + flap_summary(rows)
+    elif view == "table":
+        shown = ascii_render(rows, now) if STYLE == "ascii" else to_csv(rows, now)
+    else:
+        shown = view
+    digest = hashlib.sha256(shown.encode()).hexdigest()
+
+    prev_states = prev.get("states", {})
+    new_states = {r["key"]: r["state"] for r in rows}
+    notify = any(s in NOTIFY_ON and prev_states.get(k) != s for k, s in new_states.items())
+
+    def save(d):
+        if not opts.dry_run:
+            state_file.write_text(json.dumps({"digest": d, "states": new_states,
+                                              "identities": identities, "starts": starts,
+                                              "flap": model, "at": now}))
+
+    if digest == prev.get("digest") and not opts.force:
+        if identities != prev.get("identities", {}) or starts != prev.get("starts", {}):
+            save(digest)
+        return 0
+
+    try:
+        if flap:
+            push_flap(prev.get("flap"), model, rows, notify and bool(prev), opts.dry_run)
+        elif view == "offline":
+            push_text("[x] orca offline", "#ef4444", opts.dry_run)
+        elif view == "empty":
+            push_text("[·] no agents running", "#9ca3af", opts.dry_run)
+        elif STYLE == "ascii":
+            push_ascii(rows, now, notify and bool(prev), opts.dry_run)
+        else:
+            push_table(rows, now, notify and bool(prev), opts.dry_run)
+    except Exception as e:
+        log(str(e))
+        return 1
+
+    save(digest)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

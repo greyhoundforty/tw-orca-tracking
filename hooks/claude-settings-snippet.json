@@ -1,0 +1,14 @@
+{
+  "_comment": "Optional: merge into the \"hooks\" section of ~/.claude/settings.json so Claude state changes reach the widget immediately instead of on the next 5s tick. Keep Orca's own managed hooks in place: add these entries next to them, don't replace them.",
+  "hooks": {
+    "UserPromptSubmit": [
+      { "hooks": [ { "type": "command", "command": "(sleep 1; $HOME/bin/orca-widget-sync) >/dev/null 2>&1 &" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "(sleep 1; $HOME/bin/orca-widget-sync) >/dev/null 2>&1 &" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "(sleep 1; $HOME/bin/orca-widget-sync) >/dev/null 2>&1 &" } ] }
+    ]
+  }
+}

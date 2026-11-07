@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+._*
+.AppleDouble
+.LSOverride
+Icon?
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local runtime state (the script keeps its own in ~/.cache/orca-widget, but
+# keep any stray local copies or rendered plists out of the repo)
+.cache/
+*.log
+*.plist
+!launchd/*.plist.template
+
+# Claude Code local settings
+.claude/settings.local.json
